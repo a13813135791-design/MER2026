@@ -61,3 +61,6 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ---- 并行存在的"精选里程碑"独立 git 仓库(勿作为嵌套内容纳入;见其 README) ----
+code_git/
