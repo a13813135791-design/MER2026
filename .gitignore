@@ -1,0 +1,63 @@
+# ============================================================
+#  MER2026 Track2 (AffectGPT / EmoSync) .gitignore
+#  目标:纳管源码/配置/脚本/文档/小结果,排除下载权重与大产物
+# ============================================================
+
+# ---- 下载的预训练权重目录(~41G,整目录忽略;保留其中无,均为权重) ----
+my_affectgpt/models/Qwen3-8B/
+my_affectgpt/models/Qwen2.5-7B-Instruct/
+my_affectgpt/models/chinese-hubert-large/
+my_affectgpt/models/clip-vit-large-patch14/
+
+# ---- 权重/检查点二进制类型(安全网,任意位置) ----
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.h5
+*.msgpack
+*.onnx
+*.gguf
+*.pkl
+*.npy
+*.npz
+*.model
+
+# ---- 媒体/特征数据 ----
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wav
+*.mp3
+*.flac
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# ---- 日志 / 临时 ----
+*.log
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+
+# ---- 手工备份(纳入 git 后冗余;文件仍保留在磁盘) ----
+*.bak
+*.bak[0-9]
+*.bak_*
+
+# ---- 环境 / IDE / OS ----
+.env
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

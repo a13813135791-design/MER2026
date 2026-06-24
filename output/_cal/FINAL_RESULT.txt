@@ -1,0 +1,19 @@
+EmoSync 复现 · 最终结果 (恢复自被清理的 /tmp 日志)
+========================================================
+全量官方测试集 1200 样本 (with GT: 1200), 带 caption + 确定性解码
+
+[最终 EW-F1]
+  Qwen3 EoP (论文版, 用校准集实测真分)  = 58.68   <- 忠实复现论文完整方法
+  AffectGPT 自聚合版 (对照基线)         = 60.46
+  论文基准 (+AUR+LSC+EoP)               = 55.58
+
+[各视角真分 scores.json, 校准集332实测, 无泄漏]
+  multi=0.6073 lsc=0.5495 text=0.5467 face=0.4013 audio=0.3812
+
+[产物文件 output/results-emosync/<ckpt>/]
+  checkpoint_000035_loss_0.716.npz        全量推理(含name2aur/lsc/caption)  06-23 21:18
+  checkpoint_000035_loss_0.716-eop.npz    Qwen3 EoP                          06-23 21:32
+  *-openset.npz / *-eop-openset.npz       抽出的openset标签                  06-23 21:36-37
+
+[备注] 流水线于 06-23 21:37 前后跑完; 最终分仅打印在 /tmp/auto_pipeline.log,
+       该文件被系统 /tmp 清理 cron 删除; 已用 run_evaluation_emosync.py 重算恢复(06-24 04:2x)。

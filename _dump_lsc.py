@@ -1,0 +1,17 @@
+import numpy as np, sys
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+d = np.load("output/results-emosync/mercaptionplus_outputhybird_bestsetup_bestfusion_face_lz_20250408184/checkpoint_000035_loss_0.716.npz", allow_pickle=True)
+lsc = d["name2lsc"].tolist()
+reason = d["name2reason"].tolist()
+for i, name in enumerate(lsc.keys()):
+    print("="*70)
+    print(f"样本 {i+1}: {name}")
+    print("-"*70)
+    print("[CoT1 结构化4步]:")
+    print(lsc[name]["cot1"])
+    print("-"*70)
+    print("[CoT2 简单分步]:")
+    print(lsc[name]["cot2"])
+    print("-"*70)
+    print("[EoP 最终]:", repr(reason[name]))
+    print()
