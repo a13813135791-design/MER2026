@@ -6,7 +6,7 @@ EmoSync inference for MER2026 Track2
   LSC (Logical Self-Correction)        - 逻辑自我纠错
   EoP (Ensemble of Predictions)        - 集成投票
 """
-import os, sys, glob, argparse
+import os, sys, glob, argparse, copy, json, contextlib
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -119,43 +119,6 @@ def run_caption(chat, img_list, dataset_cls, subtitle):
         return str(cap).strip()
     except Exception as e:
         return ''
-
-
-# ── AUR 升级：每条模态流输出"情绪 + 置信度"(方案A：模型自报分) ──────────────────
-# 提示词改成要求"情绪: 0~1分数"格式；输出文本仍保留(供下游LSC/EoP读),另解析成{情绪:分数}。
-AUR_CONF_PROMPT = (
-    "Please identify all possible emotional states of the character, and assign each one a "
-    "confidence score between 0.0 and 1.0 (higher means more certain). "
-    "Output ONLY a comma-separated list in the exact format 'emotion: score', and nothing else. "
-    "Example: anxious: 0.8, tense: 0.5, calm: 0.2"
-)
-
-
-_CONF_FILLER = {'the', 'character', "character's", 'characters', 's', 'is', 'are', 'was', 'were',
-                'be', 'being', 'emotional', 'emotion', 'state', 'states', 'his', 'her', 'their',
-                'its', 'a', 'an', 'and', 'possible', 'main', 'seems', 'appears', 'feeling',
-                'feels', 'that', 'this', 'overall'}
-
-
-def parse_emotion_confidence(text):
-    """从模型输出里解析 {情绪: 置信度}。按逗号/换行/分号切条，每条取冒号前的情绪词
-       (去掉'is/state/emotional'等填充词、保留最后至多3个词) + 冒号后的 0~1 分数。
-       抽不到分数的条目跳过；容错优先，不抛异常。"""
-    import re
-    result = {}
-    for part in re.split(r'[,\n;]+', str(text)):
-        m = re.search(r'([A-Za-z][A-Za-z \-]*?)\s*[:：]\s*(0?\.\d+|1\.0+|1|0)\b', part)
-        if not m:
-            continue
-        words = [w for w in m.group(1).strip().lower().split() if w not in _CONF_FILLER]
-        emo = ' '.join(words[-3:]).strip()
-        try:
-            score = float(m.group(2))
-        except ValueError:
-            continue
-        if emo and 0.0 <= score <= 1.0:
-            result[emo] = score
-    return result
 
 
 def _make_uni_img_list(img_list_full, modality):
@@ -437,6 +400,235 @@ def run_eop(chat, aur_responses, lsc_response, subtitle):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 方案2: 基于模型 logits 的闭集情绪支持度打分 (B1 closed-set / verbalizer scoring)
+# 不让模型自报 0~1 置信度(方案1)，而是对候选情绪词做 teacher-forcing 序列对数似然打分，
+# 经长度归一 + PMI 校准 + 候选 softmax 得到每个单模态的 {情绪: 支持度}。
+# 按需求只跑 audio/face/text 三条单模态(不含 multi)。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 三条单模态 → base_dataset.py 的 mode 名
+AUR_LOGITS_MODES = {
+    'audio': 'audioonly',
+    'face':  'faceonly',
+    'text':  'textonly',
+}
+
+# 打分锚点：复刻微调答案模板 "The character's emotional state is {label}."。
+# get_prompt_for_multimodal 末尾是 "###Assistant: "，故把 lead-in 接上后 prefix 收尾在 "...is"，
+# 候选词作为 " {label}" 的自然续写被打分(token 位置与训练时一致)。
+SCORE_QUESTION = "Please recognize all possible emotional states of the character."
+SCORE_LEAD_IN  = "The character's emotional state is"
+
+
+@torch.no_grad()
+def build_prefix_embeds(chat, prompt, img_list, max_length=2000):
+    """复刻 Chat.answer_sample 的 step1-2：把多模态 patch token 替换成各模态特征 embedding，
+       拼成 inputs_embeds，但不调用 generate。返回 (prefix_embeds[1,L,H], attn[1,L])。"""
+    tok = chat.tokenizer
+    IDS = {
+        'frame': tok.get_vocab()[config.DEFAULT_FRAME_PATCH_TOKEN],
+        'face':  tok.get_vocab()[config.DEFAULT_FACE_PATCH_TOKEN],
+        'audio': tok.get_vocab()[config.DEFAULT_AUDIO_PATCH_TOKEN],
+        'multi': tok.get_vocab()[config.DEFAULT_MULTI_PATCH_TOKEN],
+        'image': tok.get_vocab()[config.DEFAULT_IMAGE_PATCH_TOKEN],
+    }
+    prompt = chat.replace_token_for_multimodal(prompt)
+    input_id = chat.to_token_ids(prompt, max_length)
+    attention_mask = input_id.ne(tok.pad_token_id).to(chat.device)
+
+    temp_input_id = copy.deepcopy(input_id).to(chat.device)
+    for pid in IDS.values():
+        temp_input_id[temp_input_id == pid] = 0
+    cur = chat.model.llama_model.model.model.embed_tokens(temp_input_id)
+    cur_ids = input_id
+    for (modality, pid, n) in [('frame', IDS['frame'], chat.num_video_query_token),
+                               ('face',  IDS['face'],  chat.num_video_query_token),
+                               ('audio', IDS['audio'], chat.num_audio_query_token),
+                               ('multi', IDS['multi'], chat.num_multi_query_token),
+                               ('image', IDS['image'], chat.num_image_query_token)]:
+        if (cur_ids == pid).sum() != 0:
+            embeds = img_list[modality]
+            assert embeds is not None, f'[build_prefix_embeds] missing embeds for {modality}'
+            start = torch.where(cur_ids == pid)[0][0]
+            cur = torch.cat((cur[:start], embeds[0], cur[start + n:]), dim=0)
+    return cur.unsqueeze(0), attention_mask.unsqueeze(0)
+
+
+def build_candidate_vocab(chat, wheel_path='emotion_wheel/wheel_mapping.npz'):
+    """候选情绪词表 E = 5 个情感轮 level1 的 keys 并集去重(与评测 EW-F1 同源)。
+       预分词缓存 {label: token_ids}，候选以 ' '+label 分词(对齐 '...is {label}' 的训练 token)。"""
+    d = np.load(wheel_path, allow_pickle=True)
+    wmw = d['wheel_map_whole'].item()
+    labels = set()
+    for wk in wmw:
+        labels |= set(wmw[wk]['level1'].keys())
+    labels = sorted(labels)
+    label2ids = {lab: chat.tokenizer(' ' + lab, add_special_tokens=False)['input_ids']
+                 for lab in labels}
+    return labels, label2ids
+
+
+def _autocast_ctx(model):
+    fn = getattr(model, 'maybe_autocast', None)
+    return fn() if callable(fn) else contextlib.nullcontext()
+
+
+@torch.no_grad()
+def score_candidates_batched(chat, prefix_embeds, attn, labels, label2ids, chunk=32):
+    """对候选标签算长度归一对数似然 s_raw（teacher forcing）。返回 {label: s_raw}。
+       优化(与逐候选打分数学等价)：候选首 token 的 logp 只由 prefix 最后位 logits 决定，
+       故先做一次 prefix 前向给所有"单 token 候选"一次性打分；仅多 token 候选才需要
+       额外的 teacher-forcing 增量前向。避免对每个候选重算 prefix。"""
+    model = chat.model
+    emb = model.llama_model.model.model.embed_tokens
+    L, H = prefix_embeds.size(1), prefix_embeds.size(2)
+    scores = {}
+
+    # (1) 一次 prefix 前向 → 最后位 log_softmax，对所有候选的"首 token"通用
+    with _autocast_ctx(model):
+        out = model.llama_model(inputs_embeds=prefix_embeds, attention_mask=attn,
+                                use_cache=False, return_dict=True)
+        last_logp = torch.log_softmax(out.logits[0, L - 1, :].float(), dim=-1)  # [V]
+
+    multi = []
+    for lab in labels:
+        ids = label2ids[lab]
+        if len(ids) == 1:                       # 单 token：s_raw = logp(首 token)
+            scores[lab] = float(last_logp[ids[0]].item())
+        else:
+            multi.append(lab)
+
+    # (2) 多 token 候选：teacher forcing 批量前向(数量很少)
+    for s in range(0, len(multi), chunk):
+        block = multi[s:s + chunk]
+        seqs = [label2ids[l] for l in block]
+        T = max(len(x) for x in seqs)
+        B = len(block)
+        cand_ids = torch.full((B, T), chat.tokenizer.pad_token_id,
+                              device=chat.device, dtype=torch.long)
+        cand_len = torch.tensor([len(x) for x in seqs], device=chat.device)
+        for i, x in enumerate(seqs):
+            cand_ids[i, :len(x)] = torch.tensor(x, device=chat.device)
+        with _autocast_ctx(model):
+            cand_emb = emb(cand_ids)                                   # [B,T,H]
+            pre = prefix_embeds.expand(B, L, H)
+            full_emb = torch.cat([pre, cand_emb], dim=1)              # [B,L+T,H]
+            cand_attn = (torch.arange(T, device=chat.device)[None, :] < cand_len[:, None]).long()
+            full_attn = torch.cat([attn.expand(B, L).long(), cand_attn], dim=1)
+            out = model.llama_model(inputs_embeds=full_emb,
+                                    attention_mask=full_attn,
+                                    use_cache=False, return_dict=True)
+            step = out.logits[:, L - 1:L - 1 + T, :].float()          # [B,T,V]
+        logp = torch.log_softmax(step, dim=-1)
+        tok_lp = logp.gather(-1, cand_ids.unsqueeze(-1)).squeeze(-1)   # [B,T]
+        mask = (torch.arange(T, device=chat.device)[None, :] < cand_len[:, None])
+        sums = (tok_lp * mask).sum(dim=1)
+        norm = sums / cand_len.clamp(min=1)                            # 长度归一
+        for i, l in enumerate(block):
+            scores[l] = float(norm[i].item())
+    return scores
+
+
+@torch.no_grad()
+def precompute_neutral_scores(chat, dataset_cls, labels, label2ids):
+    """§4.6 PMI 中性分：无任何模态证据(textonly + 空字幕 + 空 img_list)下每个候选词的
+       纯语言先验 s_raw(e|∅)。样本无关，全局算一次缓存。"""
+    empty = {k: None for k in ['audio', 'frame', 'face', 'image', 'multi']}
+    prompt = dataset_cls.get_prompt_for_multimodal('textonly', '', SCORE_QUESTION) + SCORE_LEAD_IN
+    pre, attn = build_prefix_embeds(chat, prompt, empty)
+    return score_candidates_batched(chat, pre, attn, labels, label2ids)
+
+
+@torch.no_grad()
+def run_aur_logits(chat, img_list, dataset_cls, subtitle, labels, label2ids,
+                   neutral, tau=1.0, topk=15):
+    """对 audio/face/text 三条单模态用 logits 打分候选情绪词。
+       返回 {modality: {'raw':{label:s_raw}, 'support':{label:prob}, 'topk':[[label,prob],...]}}。
+       support = softmax((s_raw - neutral)/tau)（长度归一 + PMI + 温度 softmax）。"""
+    out = {}
+    for modality, mode in AUR_LOGITS_MODES.items():
+        if modality in ('audio', 'face') and img_list.get(modality) is None:
+            out[modality] = {}
+            continue
+        uni = _make_uni_img_list(img_list, modality)
+        prompt = dataset_cls.get_prompt_for_multimodal(mode, subtitle, SCORE_QUESTION) + SCORE_LEAD_IN
+        pre, attn = build_prefix_embeds(chat, prompt, uni)
+        raw = score_candidates_batched(chat, pre, attn, labels, label2ids)
+        pmi = torch.tensor([raw[l] - neutral[l] for l in labels]) / tau
+        prob = torch.softmax(pmi, dim=0)
+        support = {labels[i]: float(prob[i]) for i in range(len(labels))}
+        top = sorted(support.items(), key=lambda kv: kv[1], reverse=True)[:topk]
+        out[modality] = {'raw': raw, 'support': support, 'topk': [[l, p] for l, p in top]}
+    return out
+
+
+def run_logits_scoring(chat, dataset_cls, name2subtitle, args, ckpt3_root, cfg):
+    """方案2 运行入口：在 track2_test.csv 上对三条单模态做 logits 闭集打分并落盘。
+       只跑修改的代码(不含 caption/LSC/EoP)。"""
+    test_csv   = os.path.join(config.DATA_DIR['MER2026'], 'track2_test.csv')
+    test_names = func_read_key_from_csv(test_csv, 'name')
+    print(f'[logits] {len(test_names)} samples from {os.path.basename(test_csv)}')
+    if args.start_idx:
+        test_names = test_names[args.start_idx:]
+    if args.max_samples:
+        test_names = test_names[:args.max_samples]
+        print(f'[logits] limited to {len(test_names)} samples')
+
+    print('[logits] building candidate vocab + neutral (PMI) scores ...')
+    labels, label2ids = build_candidate_vocab(chat)
+    neutral = precompute_neutral_scores(chat, dataset_cls, labels, label2ids)
+    print(f'[logits] candidate labels: {len(labels)}; tau={args.score_tau}')
+
+    save_root = os.path.join('output/results-emosync', os.path.basename(ckpt3_root))
+    os.makedirs(save_root, exist_ok=True)
+    epoch = os.path.basename(cfg.model_cfg.ckpt_3)[:-4]
+    save_path = f'{save_root}/{epoch}_logits.npz'
+    json_path = f'{save_root}/{epoch}_logits_topk.json'
+
+    name2logits = {}
+    readable = {}
+
+    def _save():
+        np.savez_compressed(save_path,
+                            name2logits=name2logits,
+                            candidate_labels=np.array(labels, dtype=object),
+                            neutral=neutral,
+                            score_mode='logits',
+                            tau=args.score_tau)
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(readable, f, ensure_ascii=False, indent=1)
+
+    for idx, name in enumerate(test_names):
+        subtitle = name2subtitle.get(name, '')
+        print(f'\n-- [LOGITS {idx+1}/{len(test_names)}] {name}')
+        try:
+            img_list, status = encode_sample(chat, dataset_cls, name)
+            if img_list is None:
+                print(f'  [SKIP] {status}')
+                name2logits[name] = {'status': status}
+                continue
+            res = run_aur_logits(chat, img_list, dataset_cls, subtitle,
+                                 labels, label2ids, neutral, tau=args.score_tau)
+            name2logits[name] = res
+            readable[name] = {m: d.get('topk', []) for m, d in res.items() if isinstance(d, dict)}
+            for m in AUR_LOGITS_MODES:
+                top = res.get(m, {}).get('topk', [])
+                shown = ', '.join(f'{l}:{p:.3f}' for l, p in top[:5])
+                print(f'  [{m:5s}] {shown}')
+        except Exception as e:
+            print(f'  [ERROR] {name}: {e}')
+            name2logits[name] = {'status': f'error: {e}'}
+        if (idx + 1) % 200 == 0:               # 增量 checkpoint，防长跑中断丢结果
+            _save()
+            print(f'[logits] checkpoint saved at {idx+1}/{len(test_names)}')
+
+    print(f'\n[logits] saving to {save_path} ...')
+    _save()
+    print(f'[logits] human-readable top-k saved to {json_path}')
+    print('[logits] All done.')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -454,8 +646,12 @@ if __name__ == '__main__':
                         help='从第几个样本开始(配合 max_samples 切片，用于取校准集 human[1200:])')
     parser.add_argument('--train_debug', action='store_true', default=False,
                         help='用 track2_train_human.csv 代替 candidate CSV（数据还在解压时用）')
-    parser.add_argument('--save_tag', default='',
-                        help='给输出 npz 文件名加后缀(如 _conftest)，避免覆盖已有结果')
+    parser.add_argument('--score-mode', dest='score_mode', choices=['selfreport', 'logits'],
+                        default='selfreport',
+                        help='selfreport=现状自由生成(AUR+LSC+EoP); '
+                             'logits=方案2闭集logits支持度打分(只跑audio/face/text)')
+    parser.add_argument('--score-tau', dest='score_tau', type=float, default=1.0,
+                        help='方案2候选 softmax 温度(默认1.0)')
     args = parser.parse_args()
 
     cfg           = Config(args)
@@ -529,11 +725,16 @@ if __name__ == '__main__':
         user_message = (args.outside_user_message if args.outside_user_message
                         else dataset_cls.func_get_qa_ovlabel(sample=None, question_only=True))
 
+        # ===== 方案2: logits 闭集支持度打分（只跑 audio/face/text，跳过 caption/LSC/EoP）=====
+        if args.score_mode == 'logits':
+            run_logits_scoring(chat, dataset_cls, name2subtitle, args, ckpt3_root, cfg)
+            continue
+
         # ── 输出路径 ──────────────────────────────────────────────────────
         save_root = os.path.join('output/results-emosync', os.path.basename(ckpt3_root))
         os.makedirs(save_root, exist_ok=True)
         epoch     = os.path.basename(cfg.model_cfg.ckpt_3)[:-4]
-        save_path = f'{save_root}/{epoch}{args.save_tag}.npz'
+        save_path = f'{save_root}/{epoch}.npz'
         if os.path.exists(save_path):
             print(f'[SKIP] {save_path} already exists')
             continue
@@ -544,7 +745,6 @@ if __name__ == '__main__':
         name2aur     = {}   # 4路 AUR 原始结果
         name2lsc     = {}   # LSC 结果 (cot1/cot2/fewshot)
         name2caption = {}   # AffectGPT 为每个样本生成的视频描述(caption)
-        name2aur_conf= {}   # 每条模态解析出的 {情绪: 置信度}
 
         # ===== Pass 1: AUR + LSC 零样本 CoT（两个 prompt）=====
         print('---- Pass 1: AUR + LSC zero-shot CoT (two prompts) ----')
@@ -558,19 +758,16 @@ if __name__ == '__main__':
                 continue
             # Module 0: caption — 让 AffectGPT 先生成一段客观视频描述(论文 <Caption> 字段)
             caption = run_caption(chat, img_list, dataset_cls, subtitle)
-            # Module 1: AUR — 4路并行单模态推理(caption 只进 multi 路)；用置信度提示词
-            aur = run_aur(chat, img_list, dataset_cls, subtitle, AUR_CONF_PROMPT, caption=caption)
-            aur_conf = {m: parse_emotion_confidence(aur.get(m, '')) for m in AUR_MODES}
+            # Module 1: AUR — 4路并行单模态推理(caption 只进 multi 路)
+            aur = run_aur(chat, img_list, dataset_cls, subtitle, user_message, caption=caption)
             # Module 2(a): LSC 零样本 CoT — 论文的两个 prompt(含 caption)
             cot1, cot2 = run_lsc(chat, img_list, dataset_cls, subtitle, caption=caption)
             pass1[name] = {'aur': aur, 'cot1': cot1, 'cot2': cot2,
                            'subtitle': subtitle, 'caption': caption}
             name2aur[name] = aur
-            name2aur_conf[name] = aur_conf
             name2lsc[name] = {'cot1': cot1, 'cot2': cot2}
             name2caption[name] = caption
             print(f'  [Caption]   {str(caption)[:80]}')
-            print(f'  [AUR-conf]  audio={aur_conf.get("audio")} | multi={aur_conf.get("multi")}')
             print(f'  [AUR-multi] {str(aur.get("multi",""))[:80]}')
             print(f'  [LSC-CoT1]  {str(cot1)[:80]}')
             print(f'  [LSC-CoT2]  {str(cot2)[:80]}')
@@ -611,6 +808,5 @@ if __name__ == '__main__':
                             name2reason=name2reason,
                             name2aur=name2aur,
                             name2lsc=name2lsc,
-                            name2caption=name2caption,
-                            name2aur_conf=name2aur_conf)
+                            name2caption=name2caption)
         print('All done.')
