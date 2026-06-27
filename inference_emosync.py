@@ -565,7 +565,7 @@ def run_aur_logits(chat, img_list, dataset_cls, subtitle, labels, label2ids,
 def run_logits_scoring(chat, dataset_cls, name2subtitle, args, ckpt3_root, cfg):
     """方案2 运行入口：在 track2_test.csv 上对三条单模态做 logits 闭集打分并落盘。
        只跑修改的代码(不含 caption/LSC/EoP)。"""
-    test_csv   = os.path.join(config.DATA_DIR['MER2026'], 'track2_test.csv')
+    test_csv   = args.logits_csv if getattr(args, 'logits_csv', None) else os.path.join(config.DATA_DIR['MER2026'], 'track2_test.csv')
     test_names = func_read_key_from_csv(test_csv, 'name')
     print(f'[logits] {len(test_names)} samples from {os.path.basename(test_csv)}')
     if args.start_idx:
@@ -652,6 +652,8 @@ if __name__ == '__main__':
                              'logits=方案2闭集logits支持度打分(只跑audio/face/text)')
     parser.add_argument('--score-tau', dest='score_tau', type=float, default=1.0,
                         help='方案2候选 softmax 温度(默认1.0)')
+    parser.add_argument('--logits_csv', default=None,
+                        help='v3: logits 打分改读此 csv 的 name 列(默认 track2_test.csv); 配 --start_idx/--max_samples 可扩到 human[1200:1532]')
     args = parser.parse_args()
 
     cfg           = Config(args)
