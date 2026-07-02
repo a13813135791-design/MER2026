@@ -541,7 +541,7 @@ def precompute_neutral_scores(chat, dataset_cls, labels, label2ids):
 
 @torch.no_grad()
 def run_aur_logits(chat, img_list, dataset_cls, subtitle, labels, label2ids,
-                   neutral, tau=1.0, topk=15):
+                   neutral, tau=1.0, topk=15, caption=''):
     """对 audio/face/text 三条单模态用 logits 打分候选情绪词。
        返回 {modality: {'raw':{label:s_raw}, 'support':{label:prob}, 'topk':[[label,prob],...]}}。
        support = softmax((s_raw - neutral)/tau)（长度归一 + PMI + 温度 softmax）。"""
@@ -551,7 +551,7 @@ def run_aur_logits(chat, img_list, dataset_cls, subtitle, labels, label2ids,
             out[modality] = {}
             continue
         uni = _make_uni_img_list(img_list, modality)
-        prompt = dataset_cls.get_prompt_for_multimodal(mode, subtitle, SCORE_QUESTION) + SCORE_LEAD_IN
+        prompt = dataset_cls.get_prompt_for_multimodal(mode, subtitle, SCORE_QUESTION, caption=caption) + SCORE_LEAD_IN
         pre, attn = build_prefix_embeds(chat, prompt, uni)
         raw = score_candidates_batched(chat, pre, attn, labels, label2ids)
         pmi = torch.tensor([raw[l] - neutral[l] for l in labels]) / tau
@@ -568,6 +568,18 @@ def run_logits_scoring(chat, dataset_cls, name2subtitle, args, ckpt3_root, cfg):
     test_csv   = args.logits_csv if getattr(args, 'logits_csv', None) else os.path.join(config.DATA_DIR['MER2026'], 'track2_test.csv')
     test_names = func_read_key_from_csv(test_csv, 'name')
     print(f'[logits] {len(test_names)} samples from {os.path.basename(test_csv)}')
+    import pandas as _pd
+    cap_csv = getattr(args, 'caption_csv', None)
+    name2caption = {}
+    if cap_csv and os.path.exists(cap_csv):
+        _df = _pd.read_csv(cap_csv)
+        if 'caption' in _df.columns:
+            name2caption = {str(r['name']): ('' if _pd.isna(r['caption']) else str(r['caption']))
+                            for _, r in _df.iterrows()}
+        _hit = sum(1 for n in test_names if name2caption.get(n))
+        print(f'[logits] captions loaded from {os.path.basename(cap_csv)}; hit {_hit}/{len(test_names)}')
+    else:
+        print('[logits] no caption_csv -> captions disabled')
     if args.start_idx:
         test_names = test_names[args.start_idx:]
     if args.max_samples:
@@ -584,6 +596,11 @@ def run_logits_scoring(chat, dataset_cls, name2subtitle, args, ckpt3_root, cfg):
     epoch = os.path.basename(cfg.model_cfg.ckpt_3)[:-4]
     save_path = f'{save_root}/{epoch}_logits.npz'
     json_path = f'{save_root}/{epoch}_logits_topk.json'
+    if getattr(args, 'logits_out', None):
+        save_path = args.logits_out
+        json_path = os.path.splitext(save_path)[0] + '_topk.json'
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+        print(f'[logits] custom output -> {save_path}')
 
     name2logits = {}
     readable = {}
@@ -608,7 +625,8 @@ def run_logits_scoring(chat, dataset_cls, name2subtitle, args, ckpt3_root, cfg):
                 name2logits[name] = {'status': status}
                 continue
             res = run_aur_logits(chat, img_list, dataset_cls, subtitle,
-                                 labels, label2ids, neutral, tau=args.score_tau)
+                                 labels, label2ids, neutral, tau=args.score_tau,
+                                 caption=name2caption.get(name, ''))
             name2logits[name] = res
             readable[name] = {m: d.get('topk', []) for m, d in res.items() if isinstance(d, dict)}
             for m in AUR_LOGITS_MODES:
@@ -654,6 +672,11 @@ if __name__ == '__main__':
                         help='方案2候选 softmax 温度(默认1.0)')
     parser.add_argument('--logits_csv', default=None,
                         help='v3: logits 打分改读此 csv 的 name 列(默认 track2_test.csv); 配 --start_idx/--max_samples 可扩到 human[1200:1532]')
+    parser.add_argument('--caption_csv',
+                        default='/opt/data/wlcc/mer2026-data/track2_train_human_caption-AffectGPT.csv',
+                        help='v3.1: 逐样本场景描述 caption 注入 logits 提示词(读该 csv 的 name,caption 列)')
+    parser.add_argument('--logits_out', default=None,
+                        help='v3.1: logits NPZ output path (default <ckpt>_logits.npz)')
     args = parser.parse_args()
 
     cfg           = Config(args)

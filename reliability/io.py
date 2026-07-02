@@ -83,6 +83,14 @@ def load_gate(path, tau=None, vocab_hash=None):
     if tau is not None and vocab_hash is not None:
         assert abs(g['tau'] - tau) < 1e-6 and g['vocab_hash'] == vocab_hash, \
             '[gate] tau/词表 hash 不匹配——配置漂移，请重新标定'
+    if 'mlp' in g:
+        ml = g['mlp']
+        assert ml.get('act') in ('relu', 'gelu'), '[gate] 未知激活: %s' % ml.get('act')
+        gp = {'mlp': {'W': [np.array(x, dtype=float) for x in ml['W']],
+                      'B': [np.array(x, dtype=float) for x in ml['B']],
+                      'mu': np.array(ml['mu']), 'sd': np.array(ml['sd']),
+                      'act': ml['act']}, 'T': g['T']}
+        return gp, g['pi']
     gp = {'w': np.array(g['w']),
           'b': np.array([g['b'][m] for m in MODS]),
           'mu': np.array(g['mu']),

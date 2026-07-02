@@ -28,4 +28,16 @@ def reliability_weights(feat_row, mask_row, mode, gp=None, pi=None, T_tier0=0.25
         ex = {m: np.exp(s[m] / T) for m in av}
         Z = sum(ex.values())
         return {m: ex[m] / Z for m in av}
+    if mode == 'mlp':
+        ml = gp['mlp']; W = ml['W']; B = ml['B']; mu = ml['mu']; sd = ml['sd']; act = ml['act']; T = gp['T']
+        def _fwd(x):
+            for li in range(len(W)):
+                x = W[li] @ x + B[li]
+                if li < len(W) - 1:
+                    x = np.maximum(0.0, x) if act == 'relu' \
+                        else 0.5 * x * (1.0 + np.tanh(0.7978845608028654 * (x + 0.044715 * x ** 3)))
+            return float(x[0])
+        s = {m: _fwd((feat_row[MI[m]] - mu) / sd) for m in av}
+        ex = {m: np.exp(s[m] / T) for m in av}; Z = sum(ex.values())
+        return {m: ex[m] / Z for m in av}
     raise ValueError('unknown mode: %s' % mode)

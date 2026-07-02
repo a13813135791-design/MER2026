@@ -484,13 +484,16 @@ class BaseDataset():
                     + f"Now, please answer my question based on all the provided information. {user_message} ###Assistant: "
         elif face_or_frame == 'audioonly': # (audio)
             prompt = f"###Human: The audio content is as follows: <Audio><AudioHere></Audio>. " \
+                    + (f"The caption of this video is: <Caption>{caption}</Caption>. " if caption else "") \
                     + f"Now, please answer my question based on all the provided information. {user_message} ###Assistant: "
         elif face_or_frame == 'textonly':  # (text)
             assert subtitle is not None
             prompt = f"###Human: The subtitle of this video is: <Subtitle>{subtitle}</Subtitle>. " \
+                    + (f"The caption of this video is: <Caption>{caption}</Caption>. " if caption else "") \
                     + f"Now, please answer my question based on all the provided information. {user_message} ###Assistant: "
         elif face_or_frame == 'faceonly':  # (face)
             prompt = f"###Human: We uniformly sample raw frames from the video and extract faces from these frames: <Video><FaceHere></Video>. " \
+                    + (f"The caption of this video is: <Caption>{caption}</Caption>. " if caption else "") \
                     + f"Now, please answer my question based on all the provided information. {user_message} ###Assistant: "
         elif face_or_frame == 'frameonly': # (frame)
             prompt = f"###Human: We uniformly sample raw frames from the video: <Video><FrameHere></Video>. " \
